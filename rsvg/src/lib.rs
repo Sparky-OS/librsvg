@@ -174,6 +174,7 @@ mod aspect_ratio;
 mod bbox;
 mod cairo_path;
 mod color;
+mod css_color;
 mod cond;
 mod coord_units;
 mod css;

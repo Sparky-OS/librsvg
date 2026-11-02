@@ -4,6 +4,7 @@ use cssparser::{ParseErrorKind, Parser};
 use cssparser_color as cssc;
 use cssparser_color::{hsl_to_rgb, hwb_to_rgb};
 
+use crate::css_color::{self, CssColor};
 use crate::error::*;
 use crate::parsers::Parse;
 use crate::unit_interval::UnitInterval;
@@ -20,6 +21,8 @@ pub enum Color {
     Hsl(Hsl),
     /// Specifies a color in sRGB using hue, whiteness and blackness components.
     Hwb(Hwb),
+    /// Any `<color>` of CSS Color 4, CSS Color 5 and CSS Color HDR, kept in its own colour space in double precision.
+    Css(CssColor),
 }
 
 /// A color with red, green, blue, and alpha components, in a byte each.
@@ -145,58 +148,43 @@ fn clamp_floor_256_f32(val: f32) -> u8 {
     val.round().clamp(0., 255.) as u8
 }
 
-/// Turn a short-lived [`cssparser::ParseError`] into a long-lived [`ParseError`].
-///
-/// cssparser's error type has a lifetime equal to the string being parsed.  We want
-/// a long-lived error so we can store it away if needed.  Basically, here we turn
-/// a `&str` into a `String`.
-fn map_color_parse_error(err: cssparser::ParseError<'_, ()>) -> ParseError<'_> {
-    let string_err = match err.kind {
-        ParseErrorKind::Basic(ref e) => format!("{}", e),
-        ParseErrorKind::Custom(()) => {
-            // In cssparser 0.31, the error type for Color::parse is defined like this:
-            //
-            //   pub fn parse<'i>(input: &mut Parser<'i, '_>) -> Result<Color, ParseError<'i, ()>> {
-            //
-            // The ParseError<'i, ()> means that the ParseErrorKind::Custom(T) variant will have
-            // T be the () type.
-            //
-            // So, here we match for () inside the Custom variant.  If cssparser
-            // changes its error API, this match will hopefully catch errors.
-            //
-            // Implementation detail: Color::parse() does not ever return Custom errors, only
-            // Basic ones.  So the match for Basic above handles everything, and this one
-            // for () is a dummy case.
-            "could not parse color".to_string()
-        }
-    };
-
-    ParseError {
-        kind: ParseErrorKind::Custom(ValueErrorKind::Parse(string_err)),
-        location: err.location,
-    }
-}
-
 fn parse_plain_color<'i>(parser: &mut Parser<'i, '_>) -> Result<Color, ParseError<'i>> {
     let loc = parser.current_source_location();
+    let start = parser.position();
 
-    let csscolor = cssc::Color::parse(parser).map_err(map_color_parse_error)?;
-
-    // Return only supported color types, and mark the others as errors.
-    match csscolor {
-        cssc::Color::CurrentColor => Ok(Color::CurrentColor),
-
-        cssc::Color::Rgba(rgba) => Ok(Color::Rgba(rgba.into())),
-
-        cssc::Color::Hsl(hsl) => Ok(Color::Hsl(hsl.into())),
-
-        cssc::Color::Hwb(hwb) => Ok(Color::Hwb(hwb.into())),
-
-        _ => Err(ParseError {
-            kind: ParseErrorKind::Custom(ValueErrorKind::parse_error("unsupported color syntax")),
-            location: loc,
-        }),
+    // One component value: a function with its arguments, an identifier or a hash.  Its source text goes to the
+    // CSS colour parser, which knows the whole <color> grammar.
+    let is_function = matches!(parser.next()?, cssparser::Token::Function(_));
+    if is_function {
+        parser.parse_nested_block(|p| {
+            while p.next_including_whitespace_and_comments().is_ok() {}
+            Ok::<(), ParseError<'i>>(())
+        })?;
     }
+    let text = parser.slice_from(start).trim();
+
+    if text.eq_ignore_ascii_case("currentcolor") {
+        return Ok(Color::CurrentColor);
+    }
+
+    css_color::parse_css_color(text, &css_color::Context::default())
+        .map(|css| {
+            // an sRGB colour that 8 bits hold exactly (hex, names, rgb() with integers) stays an RGBA
+            let byte = |v: f64| {
+                let b = v * 255.0;
+                if (b - b.round()).abs() < 1e-9 { Some(b.round() as u8) } else { None }
+            };
+            if css.space == css_color::Space::Srgb && css.missing == 0 {
+                if let (Some(red), Some(green), Some(blue)) = (byte(css.c[0]), byte(css.c[1]), byte(css.c[2])) {
+                    return Color::Rgba(RGBA::new(red, green, blue, css.alpha as f32));
+                }
+            }
+            Color::Css(css)
+        })
+        .map_err(|e| ParseError {
+            kind: ParseErrorKind::Custom(ValueErrorKind::parse_error(&e)),
+            location: loc,
+        })
 }
 
 /// Parse a custom property name.
@@ -284,7 +272,38 @@ pub fn color_to_rgba(color: &Color) -> RGBA {
             RGBA::from_floats(red, green, blue, hwb.alpha.unwrap_or(OPAQUE))
         }
 
+        Color::Css(css) => {
+            let ([red, green, blue, alpha], _) = color_to_rgba_f64(color);
+            let _ = css;
+            RGBA::from_floats(red as f32, green as f32, blue as f32, alpha as f32)
+        }
+
         _ => unimplemented!(),
+    }
+}
+
+/// The colour for an sRGB cairo target in double precision, gamut mapped into [0, 1] as CSS Color 4 section
+/// 14.2 says when it is outside sRGB; the second value says whether it was.
+pub fn color_to_rgba_f64(color: &Color) -> ([f64; 4], bool) {
+    match color {
+        Color::Css(css) => {
+            let (rgb, mapped) = css_color::gamut_map(css, css_color::Space::Srgb);
+            let alpha = if css.alpha_missing() { 0.0 } else { css.alpha };
+            ([rgb[0], rgb[1], rgb[2], alpha.clamp(0.0, 1.0)], mapped)
+        }
+        Color::Hsl(_) | Color::Hwb(_) | Color::Rgba(_) => {
+            let rgba = color_to_rgba(color);
+            (
+                [
+                    f64::from(rgba.red) / 255.0,
+                    f64::from(rgba.green) / 255.0,
+                    f64::from(rgba.blue) / 255.0,
+                    f64::from(rgba.alpha),
+                ],
+                false,
+            )
+        }
+        Color::CurrentColor => unimplemented!(),
     }
 }
 
@@ -337,6 +356,15 @@ pub fn resolve_color(color: &Color, opacity: UnitInterval, current_color: &Color
             ..hsl
         }),
 
+        Color::Css(css) => {
+            let mut out = css;
+            let UnitInterval(o) = opacity;
+            let alpha = if css.alpha_missing() { 0.0 } else { css.alpha };
+            out.alpha = util::clamp(alpha * o, 0.0, 1.0);
+            out.missing &= !8;
+            Color::Css(out)
+        }
+
         Color::Hwb(hwb) => Color::Hwb(Hwb {
             alpha: Some(resolve_alpha(opacity, hwb.alpha)),
             ..hwb
@@ -363,10 +391,51 @@ mod tests {
             Color::Rgba(RGBA::new(0x11, 0x22, 0x33, 1.0))
         );
 
+        // CSS Color 4 section 5.1: the precision as authored, so 50% is 0.5 rather than 128 / 255
         assert_eq!(
             Color::parse_str("var(--foo, rgb(100% 50% 25%)").unwrap(),
-            Color::Rgba(RGBA::new(0xff, 0x80, 0x40, 1.0))
+            Color::Css(CssColor::new(css_color::Space::Srgb, 1.0, 0.5, 0.25, 1.0))
         );
+    }
+
+    #[test]
+    fn parses_css_color_4_5_and_hdr() {
+        for text in [
+            "color(display-p3 0.423457 0.554321 0.676543)",
+            "lab(52.2345% 40.1645 59.9971)",
+            "oklch(0.6 0.2 30)",
+            "color(rec2100-pq 0.5 0.45 0.4)",
+            "color-mix(in oklab, #336699 30%, color(display-p3 0.9 0.6 0.1))",
+            "oklch(from #336699 calc(l + 0.1) calc(c * 1.5) calc(h + 30))",
+            "jzczhz(0.12 0.04 300)",
+        ] {
+            assert!(matches!(Color::parse_str(text).unwrap(), Color::Css(_)), "{}", text);
+        }
+    }
+
+    // a colour keeps more than 8 bits: color(srgb 0.123457 ...) reaches cairo as that value
+    #[test]
+    fn keeps_precision() {
+        let c = Color::parse_str("color(srgb 0.123457 0.654321 0.876543)").unwrap();
+        let ([r, g, b, a], mapped) = color_to_rgba_f64(&c);
+        assert!(!mapped);
+        assert!((r - 0.123457).abs() < 1e-12 && (g - 0.654321).abs() < 1e-12 && (b - 0.876543).abs() < 1e-12);
+        assert_eq!(a, 1.0);
+    }
+
+    // CSS Color 4 section 14.2: outside sRGB, the colour is gamut mapped and that is reported
+    #[test]
+    fn gamut_maps_outside_srgb() {
+        let c = Color::parse_str("color(display-p3 1 1 0)").unwrap();
+        let ([r, g, b, _], mapped) = color_to_rgba_f64(&c);
+        assert!(mapped);
+        assert!((r - 0.99116).abs() < 0.01 && (g - 0.99733).abs() < 0.01 && b.abs() < 0.01);
+    }
+
+    #[test]
+    fn invalid_colour_is_an_error_that_says_why() {
+        assert!(Color::parse_str("color(profoto-rgb 0.4835 0.9167 0.2188)").is_err());
+        assert!(Color::parse_str("lab(50% 40 abc)").is_err());
     }
 
     // FIXME: var() - when fixing #459, see the note in the code above.  All the syntaxes
