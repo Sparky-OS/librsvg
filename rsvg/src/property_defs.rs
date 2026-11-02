@@ -163,8 +163,107 @@ make_property!(
     /// [`crate::color::resolve_color`].
     Color,
     default: crate::color::Color::Rgba(crate::color::RGBA::new(0, 0, 0, 1.0)),
+    newtype: crate::color::Color,
+    property_impl: {
+        impl Property for Color {
+            fn inherits_automatically() -> bool {
+                true
+            }
+
+            // light-dark() takes the element colour scheme (CSS Color 5 section 7)
+            fn compute(&self, v: &ComputedValues) -> Self {
+                Color(self.0.for_color_scheme(v.color_scheme().used()))
+            }
+        }
+    },
+    parse_impl: {
+        impl Parse for Color {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<Color, crate::error::ParseError<'i>> {
+                Ok(Color(<crate::color::Color as Parse>::parse(parser)?))
+            }
+        }
+    }
+);
+
+/// `color-scheme` property.
+///
+/// CSS Color Adjustment 1 (CR Snapshot 30 October 2026) section 2.2:
+/// <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-prop>
+///
+/// `normal | [ light | dark | <custom-ident> ]+ && only?`.  The computed value is `normal` or a colour scheme
+/// support: the `light` and `dark` keywords in their order (a `<custom-ident>` is "meaningless" and supports nothing)
+/// and whether `only` was given.  There is no presentation attribute (SVG 2 section 6.6 lists none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColorScheme {
+    pub normal: bool,
+    pub schemes: Vec<crate::color::ColorSchemeKind>,
+    pub only: bool,
+}
+
+impl ColorScheme {
+    /// The element colour scheme (CSS Color Adjustment 1 sections 2.1 to 2.3).  librsvg has no colour scheme
+    /// preference, so: for `normal`, the page colour scheme, which SVG cannot set, so the default, light; otherwise the
+    /// first supported colour scheme in the support, or the default, light, when it lists none.
+    pub fn used(&self) -> crate::color::ColorSchemeKind {
+        if self.normal {
+            return crate::color::ColorSchemeKind::Light;
+        }
+        self.schemes.first().copied().unwrap_or(crate::color::ColorSchemeKind::Light)
+    }
+}
+
+make_property!(
+    ColorScheme,
+    default: ColorScheme { normal: true, schemes: Vec::new(), only: false },
     inherits_automatically: true,
-    newtype_parse: crate::color::Color,
+    parse_impl: {
+        impl Parse for ColorScheme {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<ColorScheme, crate::error::ParseError<'i>> {
+                let loc = parser.current_source_location();
+                let mut idents = Vec::new();
+                while let Ok(token) = parser.next() {
+                    match token {
+                        Token::Ident(s) => idents.push(s.to_ascii_lowercase()),
+                        t => {
+                            let t = t.clone();
+                            return Err(loc.new_unexpected_token_error(t));
+                        }
+                    }
+                }
+                let invalid = || loc.new_custom_error(ValueErrorKind::parse_error("invalid color-scheme"));
+                if idents.is_empty() {
+                    return Err(invalid());
+                }
+                if idents.len() == 1 && idents[0] == "normal" {
+                    return Ok(ColorScheme { normal: true, schemes: Vec::new(), only: false });
+                }
+                let mut value = ColorScheme { normal: false, schemes: Vec::new(), only: false };
+                let mut count = 0;
+                let last = idents.len() - 1;
+                for (i, ident) in idents.iter().enumerate() {
+                    match ident.as_str() {
+                        // && only?: once, before or after the colour schemes
+                        "only" if !value.only && (i == 0 || i == last) => value.only = true,
+                        "only" | "normal" | "default" | "initial" | "inherit" | "unset" | "revert"
+                        | "revert-layer" => return Err(invalid()),
+                        "light" => {
+                            count += 1;
+                            value.schemes.push(crate::color::ColorSchemeKind::Light);
+                        }
+                        "dark" => {
+                            count += 1;
+                            value.schemes.push(crate::color::ColorSchemeKind::Dark);
+                        }
+                        _ => count += 1,
+                    }
+                }
+                if count == 0 {
+                    return Err(invalid());
+                }
+                Ok(value)
+            }
+        }
+    }
 );
 
 make_property!(
@@ -357,8 +456,26 @@ make_property!(
     default: PaintServer::SolidColor(crate::color::Color::Rgba(
         crate::color::RGBA::new(0, 0, 0, 1.0)
     )),
-    inherits_automatically: true,
-    newtype_parse: PaintServer,
+    newtype: PaintServer,
+    property_impl: {
+        impl Property for Fill {
+            fn inherits_automatically() -> bool {
+                true
+            }
+
+            // light-dark() takes the element colour scheme (CSS Color 5 section 7)
+            fn compute(&self, v: &ComputedValues) -> Self {
+                Fill(self.0.for_color_scheme(v.color_scheme().used()))
+            }
+        }
+    },
+    parse_impl: {
+        impl Parse for Fill {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<Fill, crate::error::ParseError<'i>> {
+                Ok(Fill(<PaintServer as Parse>::parse(parser)?))
+            }
+        }
+    }
 );
 
 make_property!(
@@ -431,8 +548,26 @@ make_property!(
     /// Filter Effects 1: <https://www.w3.org/TR/filter-effects/#FloodColorProperty>
     FloodColor,
     default: crate::color::Color::Rgba(crate::color::RGBA::new(0, 0, 0, 1.0)),
-    inherits_automatically: false,
-    newtype_parse: crate::color::Color,
+    newtype: crate::color::Color,
+    property_impl: {
+        impl Property for FloodColor {
+            fn inherits_automatically() -> bool {
+                false
+            }
+
+            // light-dark() takes the element colour scheme (CSS Color 5 section 7)
+            fn compute(&self, v: &ComputedValues) -> Self {
+                FloodColor(self.0.for_color_scheme(v.color_scheme().used()))
+            }
+        }
+    },
+    parse_impl: {
+        impl Parse for FloodColor {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<FloodColor, crate::error::ParseError<'i>> {
+                Ok(FloodColor(<crate::color::Color as Parse>::parse(parser)?))
+            }
+        }
+    }
 );
 
 make_property!(
@@ -642,8 +777,26 @@ make_property!(
     /// Filter Effects 1: <https://www.w3.org/TR/filter-effects/#LightingColorProperty>
     LightingColor,
     default: crate::color::Color::Rgba(crate::color::RGBA::new(255, 255, 255, 1.0)),
-    inherits_automatically: false,
-    newtype_parse: crate::color::Color,
+    newtype: crate::color::Color,
+    property_impl: {
+        impl Property for LightingColor {
+            fn inherits_automatically() -> bool {
+                false
+            }
+
+            // light-dark() takes the element colour scheme (CSS Color 5 section 7)
+            fn compute(&self, v: &ComputedValues) -> Self {
+                LightingColor(self.0.for_color_scheme(v.color_scheme().used()))
+            }
+        }
+    },
+    parse_impl: {
+        impl Parse for LightingColor {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<LightingColor, crate::error::ParseError<'i>> {
+                Ok(LightingColor(<crate::color::Color as Parse>::parse(parser)?))
+            }
+        }
+    }
 );
 
 make_property!(
@@ -924,8 +1077,26 @@ make_property!(
     /// SVG2: <https://www.w3.org/TR/SVG2/pservers.html#StopColorProperty>
     StopColor,
     default: crate::color::Color::Rgba(crate::color::RGBA::new(0, 0, 0, 1.0)),
-    inherits_automatically: false,
-    newtype_parse: crate::color::Color,
+    newtype: crate::color::Color,
+    property_impl: {
+        impl Property for StopColor {
+            fn inherits_automatically() -> bool {
+                false
+            }
+
+            // light-dark() takes the element colour scheme (CSS Color 5 section 7)
+            fn compute(&self, v: &ComputedValues) -> Self {
+                StopColor(self.0.for_color_scheme(v.color_scheme().used()))
+            }
+        }
+    },
+    parse_impl: {
+        impl Parse for StopColor {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<StopColor, crate::error::ParseError<'i>> {
+                Ok(StopColor(<crate::color::Color as Parse>::parse(parser)?))
+            }
+        }
+    }
 );
 
 make_property!(
@@ -944,8 +1115,26 @@ make_property!(
     /// SVG2: <https://www.w3.org/TR/SVG2/painting.html#SpecifyingStrokePaint>
     Stroke,
     default: PaintServer::None,
-    inherits_automatically: true,
-    newtype_parse: PaintServer,
+    newtype: PaintServer,
+    property_impl: {
+        impl Property for Stroke {
+            fn inherits_automatically() -> bool {
+                true
+            }
+
+            // light-dark() takes the element colour scheme (CSS Color 5 section 7)
+            fn compute(&self, v: &ComputedValues) -> Self {
+                Stroke(self.0.for_color_scheme(v.color_scheme().used()))
+            }
+        }
+    },
+    parse_impl: {
+        impl Parse for Stroke {
+            fn parse<'i>(parser: &mut Parser<'i, '_>) -> Result<Stroke, crate::error::ParseError<'i>> {
+                Ok(Stroke(<PaintServer as Parse>::parse(parser)?))
+            }
+        }
+    }
 );
 
 make_property!(

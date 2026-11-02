@@ -495,6 +495,8 @@ make_properties! {
     }
     
     longhands_not_supported_by_markup5ever: {
+        // SVG 2 section 6.6 gives color-scheme no presentation attribute
+        "color-scheme"                => (PresentationAttr::No,  color_scheme                : ColorScheme),
         "isolation"                   => (PresentationAttr::No,  isolation                   : Isolation),
         "line-height"                 => (PresentationAttr::No,  line_height                 : LineHeight),
         "mask-type"                   => (PresentationAttr::Yes, mask_type                   : MaskType),
@@ -694,6 +696,10 @@ impl SpecifiedValues {
         // depends on font-size.
 
         compute!(FontSize, font_size);
+
+        // Then color-scheme: the colours of the element follow its colour scheme (CSS Color 5 section 7).
+
+        compute!(ColorScheme, color_scheme);
 
         // Then, do all the other properties.
 

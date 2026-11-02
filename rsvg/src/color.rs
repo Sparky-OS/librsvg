@@ -23,6 +23,51 @@ pub enum Color {
     Hwb(Hwb),
     /// Any `<color>` of CSS Color 4, CSS Color 5 and CSS Color HDR, kept in its own colour space in double precision.
     Css(CssColor),
+    /// A colour that depends on the element colour scheme through `light-dark()`, anywhere in it (CSS Color 5
+    /// section 7): what it is in a light and in a dark colour scheme.  Computing the property on an element
+    /// resolves it with [`Color::for_color_scheme`]; it never reaches drawing.
+    LightDark(LightDark),
+}
+
+/// The two values of a colour that contains `light-dark()`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LightDark {
+    pub light: CssColor,
+    pub dark: CssColor,
+}
+
+/// The colour schemes librsvg supports (CSS Color Adjustment 1, section 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorSchemeKind {
+    Light,
+    Dark,
+}
+
+impl Color {
+    /// The colour in an element colour scheme: a `light-dark()` colour becomes its light or its dark value.
+    pub fn for_color_scheme(&self, scheme: ColorSchemeKind) -> Color {
+        match self {
+            Color::LightDark(ld) => css_to_color(match scheme {
+                ColorSchemeKind::Light => ld.light,
+                ColorSchemeKind::Dark => ld.dark,
+            }),
+            other => *other,
+        }
+    }
+}
+
+/// An sRGB colour that 8 bits hold exactly (hex, names, rgb() with integers) stays an RGBA; any other is a CSS colour.
+fn css_to_color(css: CssColor) -> Color {
+    let byte = |v: f64| {
+        let b = v * 255.0;
+        if (b - b.round()).abs() < 1e-9 { Some(b.round() as u8) } else { None }
+    };
+    if css.space == css_color::Space::Srgb && css.missing == 0 {
+        if let (Some(red), Some(green), Some(blue)) = (byte(css.c[0]), byte(css.c[1]), byte(css.c[2])) {
+            return Color::Rgba(RGBA::new(red, green, blue, css.alpha as f32));
+        }
+    }
+    Color::Css(css)
 }
 
 /// A color with red, green, blue, and alpha components, in a byte each.
@@ -167,20 +212,31 @@ fn parse_plain_color<'i>(parser: &mut Parser<'i, '_>) -> Result<Color, ParseErro
         return Ok(Color::CurrentColor);
     }
 
-    css_color::parse_css_color(text, &css_color::Context::default())
-        .map(|css| {
-            // an sRGB colour that 8 bits hold exactly (hex, names, rgb() with integers) stays an RGBA
-            let byte = |v: f64| {
-                let b = v * 255.0;
-                if (b - b.round()).abs() < 1e-9 { Some(b.round() as u8) } else { None }
-            };
-            if css.space == css_color::Space::Srgb && css.missing == 0 {
-                if let (Some(red), Some(green), Some(blue)) = (byte(css.c[0]), byte(css.c[1]), byte(css.c[2])) {
-                    return Color::Rgba(RGBA::new(red, green, blue, css.alpha as f32));
-                }
+    let light = css_color::parse_css_color(text, &css_color::Context::default());
+
+    // The colour is parsed before the cascade knows the element colour scheme.  The only part of a colour that depends
+    // on it is light-dark() (librsvg has no system colours), and that is a choice between two, so a colour that
+    // contains light-dark() is parsed for both colour schemes, and the property's computed value takes one.
+    if text.to_ascii_lowercase().contains("light-dark") {
+        let dark = css_color::parse_css_color(
+            text,
+            &css_color::Context {
+                dark_scheme: true,
+                ..Default::default()
+            },
+        );
+        if let (Ok(light), Ok(dark)) = (&light, &dark) {
+            if light != dark {
+                return Ok(Color::LightDark(LightDark {
+                    light: *light,
+                    dark: *dark,
+                }));
             }
-            Color::Css(css)
-        })
+        }
+    }
+
+    light
+        .map(css_to_color)
         .map_err(|e| ParseError {
             kind: ParseErrorKind::Custom(ValueErrorKind::parse_error(&e)),
             location: loc,
@@ -278,6 +334,9 @@ pub fn color_to_rgba(color: &Color) -> RGBA {
             RGBA::from_floats(red as f32, green as f32, blue as f32, alpha as f32)
         }
 
+        // not resolved by a computed value (a filter function's colour): the default colour scheme, light
+        Color::LightDark(_) => color_to_rgba(&color.for_color_scheme(ColorSchemeKind::Light)),
+
         _ => unimplemented!(),
     }
 }
@@ -303,6 +362,7 @@ pub fn color_to_rgba_f64(color: &Color) -> ([f64; 4], bool) {
                 false,
             )
         }
+        Color::LightDark(_) => color_to_rgba_f64(&color.for_color_scheme(ColorSchemeKind::Light)),
         Color::CurrentColor => unimplemented!(),
     }
 }
@@ -336,15 +396,17 @@ pub fn resolve_color(color: &Color, opacity: UnitInterval, current_color: &Color
             if let Color::CurrentColor = current_color {
                 black()
             } else {
-                *current_color
+                current_color.for_color_scheme(ColorSchemeKind::Light)
             }
         }
+
+        Color::LightDark(_) => color.for_color_scheme(ColorSchemeKind::Light),
 
         _ => *color,
     };
 
     match without_opacity_applied {
-        Color::CurrentColor => unreachable!(),
+        Color::CurrentColor | Color::LightDark(_) => unreachable!(),
 
         Color::Rgba(rgba) => Color::Rgba(RGBA {
             alpha: resolve_alpha(opacity, Some(rgba.alpha)),
@@ -375,6 +437,30 @@ pub fn resolve_color(color: &Color, opacity: UnitInterval, current_color: &Color
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_dark_keeps_both_colors() {
+        let c = Color::parse_str("color-mix(in srgb, light-dark(#336699, #996633), white)").unwrap();
+        assert!(matches!(c, Color::LightDark(_)));
+        assert_eq!(
+            c.for_color_scheme(ColorSchemeKind::Light),
+            Color::parse_str("color-mix(in srgb, #336699, white)").unwrap()
+        );
+        assert_eq!(
+            c.for_color_scheme(ColorSchemeKind::Dark),
+            Color::parse_str("color-mix(in srgb, #996633, white)").unwrap()
+        );
+        // the same colour in both is no light-dark() colour
+        assert_eq!(Color::parse_str("light-dark(red, red)").unwrap(), Color::Rgba(RGBA::new(255, 0, 0, 1.0)));
+    }
+
+    #[test]
+    fn contrast_color_is_not_plain_wcag() {
+        // WCAG 2.1's larger ratio would give black on red; white has 4:1
+        assert_eq!(Color::parse_str("contrast-color(red)").unwrap(), Color::Rgba(RGBA::new(255, 255, 255, 1.0)));
+        // white would have less than 3:1 on #ff6600
+        assert_eq!(Color::parse_str("contrast-color(#ff6600)").unwrap(), Color::Rgba(RGBA::new(0, 0, 0, 1.0)));
+    }
 
     #[test]
     fn parses_plain_color() {

@@ -1058,7 +1058,7 @@ const SYSTEM_COLORS: &[&str] = &[
 pub struct Context {
     /// the value of currentcolor, when it is known where the colour is parsed
     pub current_color: Option<CssColor>,
-    /// CSS Color 5 section 7: light-dark() takes its second colour in a dark colour scheme
+    /// CSS Color 5 section 7: light-dark() takes its second colour when the element colour scheme is dark
     pub dark_scheme: bool,
 }
 
@@ -1934,17 +1934,36 @@ fn hex(h: &str) -> PResult<CssColor> {
     }
 }
 
-/// CSS Color 5 section 8: white or black, whichever contrasts more; white on a tie.  The algorithm is UA-defined;
-/// this one uses the WCAG 2.1 relative luminance of the gamut-mapped sRGB colour.
+/// CSS Color 5 section 8: white or black, "whichever produces maximum color contrast for text when the input color
+/// is used as a solid background", white on a tie; the algorithm is UA-defined, UAs "are advised to not simply use
+/// the WCAG 2.1 section 1.4.3 Contrast (Minimum) contrast ratio algorithm", and the result "should still meet the
+/// WCAG 2.1 section 1.4.3 Contrast (Minimum) for AA large text", 3:1.
+///
+/// The background is the colour as an opaque sRGB colour, gamut mapped (CSS Color 4 section 14.2).  Black when its
+/// Oklab lightness is above 0.7, white otherwise: Lea Verou found that over the OKLCH reference range neither black
+/// nor white text fails APCA, a perceptual contrast algorithm, for lightness between 0.687 and 0.716 ("On
+/// automatically generating contrasting text colors with CSS", 2024).  Then, when the choice has a WCAG 2.1 contrast
+/// ratio below 3:1 with the background, the other one, which always has at least 4.58:1.
 fn contrast_color(c: &CssColor) -> CssColor {
+    const LIGHTNESS_THRESHOLD: f64 = 0.7;
+    const WCAG_LARGE_TEXT_AA: f64 = 3.0;
+
     let mut opaque = *c;
     opaque.set_alpha(1.0);
     let (rgb, _) = gamut_map(&opaque, Space::Srgb);
-    let lum = mul(&SRGB_TO_XYZ, &lin_srgb(&rgb))[1];
-    if 1.05 / (lum + 0.05) >= (lum + 0.05) / 0.05 {
-        CssColor::srgb8(0xffffff, 1.0)
-    } else {
+    let xyz = mul(&SRGB_TO_XYZ, &lin_srgb(&rgb));
+    let lum = xyz[1];
+    let lightness = xyz_to_oklab(&xyz)[0];
+    let with_white = 1.05 / (lum + 0.05);
+    let with_black = (lum + 0.05) / 0.05;
+    let mut black = lightness > LIGHTNESS_THRESHOLD;
+    if (black && with_black < WCAG_LARGE_TEXT_AA) || (!black && with_white < WCAG_LARGE_TEXT_AA) {
+        black = !black;
+    }
+    if black {
         CssColor::srgb8(0x000000, 1.0)
+    } else {
+        CssColor::srgb8(0xffffff, 1.0)
     }
 }
 
