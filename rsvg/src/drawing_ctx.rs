@@ -12,7 +12,7 @@ use std::{borrow::Cow, sync::OnceLock};
 use crate::accept_language::UserLanguage;
 use crate::bbox::BoundingBox;
 use crate::cairo_path::CairoPath;
-use crate::color::{Color, color_to_rgba};
+use crate::color::{Color, color_to_rgba_f64};
 use crate::coord_units::CoordUnits;
 use crate::document::{AcquiredNodes, NodeId, RenderingOptions};
 use crate::dpi::Dpi;
@@ -1376,6 +1376,7 @@ impl DrawingCtx {
         acquired_nodes: &mut AcquiredNodes<'_>,
         viewport: &Viewport,
     ) -> Result<bool, Box<InternalRenderingError>> {
+        log_gamut_mapping(&self.session, paint_source);
         match *paint_source {
             UserSpacePaintSource::Gradient(ref gradient, _c) => {
                 set_gradient_on_cairo(&self.cr, gradient)?;
@@ -2122,15 +2123,38 @@ pub fn create_pango_context(font_options: &FontOptions) -> pango::Context {
     context
 }
 
-pub fn set_source_color_on_cairo(cr: &cairo::Context, color: &Color) {
-    let rgba = color_to_rgba(color);
+/// Says when a color is outside sRGB, the space of librsvg's cairo targets, and so is drawn gamut mapped
+/// (CSS Color 4 section 14.2).
+fn log_gamut_mapping(session: &Session, paint_source: &UserSpacePaintSource) {
+    let report = |color: &Color| {
+        if let Color::Css(css) = color {
+            if color_to_rgba_f64(color).1 {
+                rsvg_log!(
+                    session,
+                    "color({} {} {} {} / {}) is outside sRGB; it is drawn gamut mapped, as CSS Color 4 \
+                     section 14.2 says",
+                    css.space.name(),
+                    css.c[0],
+                    css.c[1],
+                    css.c[2],
+                    css.alpha
+                );
+            }
+        }
+    };
+    match *paint_source {
+        UserSpacePaintSource::SolidColor(ref c) => report(c),
+        UserSpacePaintSource::Pattern(_, Some(ref c)) => report(c),
+        UserSpacePaintSource::Gradient(ref g, _) => g.stops.iter().for_each(|s| report(&s.color)),
+        _ => (),
+    }
+}
 
-    cr.set_source_rgba(
-        f64::from(rgba.red) / 255.0,
-        f64::from(rgba.green) / 255.0,
-        f64::from(rgba.blue) / 255.0,
-        f64::from(rgba.alpha),
-    );
+pub fn set_source_color_on_cairo(cr: &cairo::Context, color: &Color) {
+    let ([red, green, blue, alpha], _) = color_to_rgba_f64(color);
+
+    // in double precision: cairo keeps 16 bits per channel for a solid source
+    cr.set_source_rgba(red, green, blue, alpha);
 }
 
 fn set_gradient_on_cairo(
@@ -2158,15 +2182,9 @@ fn set_gradient_on_cairo(
     for stop in &gradient.stops {
         let UnitInterval(stop_offset) = stop.offset;
 
-        let rgba = color_to_rgba(&stop.color);
+        let ([red, green, blue, alpha], _) = color_to_rgba_f64(&stop.color);
 
-        g.add_color_stop_rgba(
-            stop_offset,
-            f64::from(rgba.red) / 255.0,
-            f64::from(rgba.green) / 255.0,
-            f64::from(rgba.blue) / 255.0,
-            f64::from(rgba.alpha),
-        );
+        g.add_color_stop_rgba(stop_offset, red, green, blue, alpha);
     }
 
     Ok(cr.set_source(&g)?)

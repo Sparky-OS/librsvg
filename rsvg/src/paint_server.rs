@@ -121,6 +121,18 @@ impl Parse for PaintServer {
 }
 
 impl PaintServer {
+    /// The paint in an element color scheme: its colors with light-dark() resolved (CSS Color 5 section 7).
+    pub fn for_color_scheme(&self, scheme: crate::color::ColorSchemeKind) -> PaintServer {
+        match self {
+            PaintServer::SolidColor(c) => PaintServer::SolidColor(c.for_color_scheme(scheme)),
+            PaintServer::Iri { iri, alternate } => PaintServer::Iri {
+                iri: iri.clone(),
+                alternate: alternate.map(|c| c.for_color_scheme(scheme)),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Resolves colors, plus node references for gradients and patterns.
     ///
     /// `opacity` depends on `strokeOpacity` or `fillOpacity` depending on whether
